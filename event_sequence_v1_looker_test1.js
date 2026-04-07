@@ -55,21 +55,19 @@ looker.plugins.visualizations.add({
   },
 
   updateAsync: function (data, element, config, queryResponse, details, doneRendering) {
-    const container = getOrCreateContainer(element);
+  const container = getOrCreateContainer(element);
 
-    try {
-      renderLookerViz(data, element, config || {}, queryResponse);
-      doneRendering();
-    } catch (err) {
-      container.innerHTML = `
-        <div style="padding:16px;color:#b00020;font-family:Arial,sans-serif;white-space:pre-wrap;">
-          Visualization error: ${err && err.message ? err.message : String(err)}
-        </div>
-      `;
-      console.error(err);
-      doneRendering();
-    }
-  }
+  container.innerHTML = `
+    <div style="padding:16px;font-family:Arial,sans-serif;color:#111;">
+      <div><b>updateAsync reached</b></div>
+      <div>rows: ${Array.isArray(data) ? data.length : "not-array"}</div>
+      <div>dimensions: ${((queryResponse && queryResponse.fields && queryResponse.fields.dimension_like) || []).length}</div>
+      <div>measures: ${((queryResponse && queryResponse.fields && queryResponse.fields.measure_like) || []).length}</div>
+    </div>
+  `;
+
+  doneRendering();
+}
 });
 
 const SVG_NS = "http://www.w3.org/2000/svg";
