@@ -55,7 +55,7 @@ looker.plugins.visualizations.add({
 
   updateAsync: function (data, element, config, queryResponse, details, doneRendering) {
     try {
-      renderLookerViz(data, element, config || {});
+      renderLookerViz(data, element, config || {}, queryResponse);
       doneRendering();
     } catch (err) {
       const container = element.querySelector("#viz");
@@ -157,6 +157,26 @@ function escapeText(v) {
   return v == null ? "" : String(v);
 }
 
+function getOrderedFieldNames(queryResponse) {
+  const dims = (queryResponse.fields && queryResponse.fields.dimension_like) || [];
+  return dims.map(f => f.name);
+}
+
+function findTooltipFieldName(queryResponse) {
+  const ordered = getOrderedFieldNames(queryResponse);
+
+  const idx = ordered.findIndex(name => {
+    const lower = name.toLowerCase();
+    return lower === "called_final_call_label" || lower.endsWith(".called_final_call_label");
+  });
+
+  if (idx >= 0 && idx + 1 < ordered.length) {
+    return ordered[idx + 1];
+  }
+
+  return null;
+}
+
 function normalizeNode(v) {
   if (!v) return "";
   return String(v).trim().toUpperCase();
@@ -216,20 +236,22 @@ function buildLaneNames(nodeSet, configuredOrder) {
   return laneNames;
 }
 
-function getLookerRows(data, config) {
+
+function getLookerRows(data, config, queryResponse) {
+  const tooltipFieldName = findTooltipFieldName(queryResponse);
   const rows = data.map(r => ({
-    source_number: escapeText(getRowValue(r, ["source_number"])),
-    event_name: escapeText(getRowValue(r, ["event_name"])),
-    start_ts_raw: escapeText(getRowValue(r, ["start_ts", "start_timestamp", "timestamp"])),
-    rat_name: escapeText(getRowValue(r, ["rat_name", "rat"])),
-    cell_id: escapeText(getRowValue(r, ["cell_id", "cell"])),
-    source_node: normalizeNode(getRowValue(r, ["source_node", "src_node", "from_node"])),
-    destination_node: normalizeNode(getRowValue(r, ["destination_node", "dst_node", "to_node"])),
-    remarks: escapeText(getRowValue(r, ["remarks", "remark"])),
-    calling_final_call_label: escapeText(getRowValue(r, ["calling_final_call_label", "calling_label"])),
-    called_final_call_label: escapeText(getRowValue(r, ["called_final_call_label", "called_label"])),
-    tooltip: escapeText(getRowValue(r, ["tooltip", "details", "description"]))
-  }));
+  source_number: escapeText(getRowValue(r, ["call_flow_label"])),
+  event_name: escapeText(getRowValue(r, ["event_name"])),
+  start_ts_raw: escapeText(getRowValue(r, ["start_ts", "start_timestamp", "timestamp"])),
+  rat_name: escapeText(getRowValue(r, ["rat_name", "rat"])),
+  cell_id: escapeText(getRowValue(r, ["cell_id", "cell"])),
+  source_node: normalizeNode(getRowValue(r, ["source_node", "src_node", "from_node"])),
+  destination_node: normalizeNode(getRowValue(r, ["destination_node", "dst_node", "to_node"])),
+  remarks: escapeText(getRowValue(r, ["remarks", "remark"])),
+  calling_final_call_label: escapeText(getRowValue(r, ["calling_final_call_label", "calling_label"])),
+  called_final_call_label: escapeText(getRowValue(r, ["called_final_call_label", "called_label"])),
+  tooltip: tooltipFieldName ? escapeText(cellToString(r[tooltipFieldName])) : ""
+}));
 
   const nodeSet = new Set();
   rows.forEach(r => {
@@ -557,12 +579,12 @@ function drawCrossLaneEvent(svg, row, x1, x2, y, showTooltips) {
   svg.appendChild(g);
 }
 
-function renderLookerViz(data, element, config) {
+function renderLookerViz(data, element, config, queryResponse) {
   const container = element.querySelector("#viz");
   clearElement(container);
 
   const layout = getLayoutConfig(config || {});
-  const parsed = getLookerRows(data, config || {});
+  const parsed = getLookerRows(data, config || {}, queryResponse);
   const rows = parsed.rows;
   const laneNames = parsed.laneNames;
 
