@@ -1,6 +1,6 @@
 looker.plugins.visualizations.add({
-  id: "network_sequence_trace",
-  label: "Network Sequence Trace",
+  id: "event_sequence_v1",
+  label: "Event Sequence V1.0",
 
   options: {
     lane_order: {
@@ -44,6 +44,7 @@ looker.plugins.visualizations.add({
         .network-sequence-trace-root {
           width: 100%;
           height: 100%;
+          min-height: 500px;
           overflow: auto;
           background: #ffffff;
           font-family: Arial, sans-serif;
@@ -54,14 +55,17 @@ looker.plugins.visualizations.add({
   },
 
   updateAsync: function (data, element, config, queryResponse, details, doneRendering) {
+    const container = getOrCreateContainer(element);
+
     try {
       renderLookerViz(data, element, config || {}, queryResponse);
       doneRendering();
     } catch (err) {
-      const container = element.querySelector("#viz");
-      if (container) {
-        container.innerHTML = `<div style="padding:16px;color:#b00020;font-family:Arial,sans-serif;white-space:pre-wrap;">Visualization error: ${err.message}</div>`;
-      }
+      container.innerHTML = `
+        <div style="padding:16px;color:#b00020;font-family:Arial,sans-serif;white-space:pre-wrap;">
+          Visualization error: ${err && err.message ? err.message : String(err)}
+        </div>
+      `;
       console.error(err);
       doneRendering();
     }
@@ -183,6 +187,22 @@ function clearElement(el) {
   while (el.firstChild) el.removeChild(el.firstChild);
 }
 
+function getOrCreateContainer(element) {
+  let container = element.querySelector("#viz");
+
+  if (!container) {
+    element.innerHTML = `
+      <div id="viz"
+           class="network-sequence-trace-root"
+           style="width:100%;height:100%;min-height:500px;overflow:auto;background:#ffffff;font-family:Arial,sans-serif;">
+      </div>
+    `;
+    container = element.querySelector("#viz");
+  }
+
+  return container;
+}
+
 function cellToString(cell) {
   if (cell == null) return "";
   if (typeof cell !== "object") return String(cell);
@@ -294,6 +314,10 @@ function getLookerRows(data, config, queryResponse) {
     tooltip: escapeText(cellToString(r[fieldMap.tooltip]))
   }));
 
+  if (!rows.length) {
+    throw new Error(`No rows were built from Looker data.\n${REQUIRED_SEQUENCE_TEXT}`);
+  }
+
   const nodeSet = new Set();
   rows.forEach(r => {
     if (r.source_node) nodeSet.add(r.source_node);
@@ -302,6 +326,10 @@ function getLookerRows(data, config, queryResponse) {
 
   const layout = getLayoutConfig(config || {});
   const laneNames = buildLaneNames(nodeSet, layout.laneOrder);
+
+  if (!laneNames.length) {
+    throw new Error(`No lane names could be derived from source_node / destination_node.\n${REQUIRED_SEQUENCE_TEXT}`);
+  }
 
   const laneIndex = {};
   laneNames.forEach((name, idx) => {
@@ -353,12 +381,21 @@ function addTitle(svg, sourceNumber, callingLabel, calledLabel) {
     "font-weight": "700",
     fill: "#222"
   });
-  title.textContent = sourceNumber ? `Call Sequence | ${sourceNumber}` : "Call Sequence";
+  title.textContent = sourceNumber ? `Event Sequence V1.0 | ${sourceNumber}` : "Event Sequence V1.0";
   svg.appendChild(title);
+
+  const authorText = createSvgEl("text", {
+    x: 20,
+    y: 40,
+    "font-size": 10,
+    fill: "#777"
+  });
+  authorText.textContent = "Developed by Hamid Roshan";
+  svg.appendChild(authorText);
 
   const badge1 = createSvgEl("rect", {
     x: 20,
-    y: 42,
+    y: 52,
     rx: 4,
     ry: 4,
     width: 170,
@@ -370,7 +407,7 @@ function addTitle(svg, sourceNumber, callingLabel, calledLabel) {
 
   const badge1Text = createSvgEl("text", {
     x: 30,
-    y: 58,
+    y: 68,
     "font-size": 12,
     fill: "#222"
   });
@@ -379,7 +416,7 @@ function addTitle(svg, sourceNumber, callingLabel, calledLabel) {
 
   const badge2 = createSvgEl("rect", {
     x: 205,
-    y: 42,
+    y: 52,
     rx: 4,
     ry: 4,
     width: 170,
@@ -391,7 +428,7 @@ function addTitle(svg, sourceNumber, callingLabel, calledLabel) {
 
   const badge2Text = createSvgEl("text", {
     x: 215,
-    y: 58,
+    y: 68,
     "font-size": 12,
     fill: "#222"
   });
@@ -621,16 +658,31 @@ function drawCrossLaneEvent(svg, row, x1, x2, y, showTooltips) {
 }
 
 function renderLookerViz(data, element, config, queryResponse) {
-  const container = element.querySelector("#viz");
+  const container = getOrCreateContainer(element);
   clearElement(container);
+
+  if (!data || !Array.isArray(data)) {
+    container.innerHTML = "<div style='padding:16px;font-family:Arial,sans-serif;color:#b00020;'>No Looker data array received.</div>";
+    return;
+  }
+
+  if (!queryResponse || !queryResponse.fields) {
+    container.innerHTML = "<div style='padding:16px;font-family:Arial,sans-serif;color:#b00020;'>No queryResponse.fields received.</div>";
+    return;
+  }
 
   const layout = getLayoutConfig(config || {});
   const parsed = getLookerRows(data, config || {}, queryResponse);
   const rows = parsed.rows;
   const laneNames = parsed.laneNames;
 
-  if (!rows.length || !laneNames.length) {
-    container.innerHTML = "<div style='padding:16px;font-family:Arial,sans-serif;'>No data available.</div>";
+  if (!rows.length) {
+    container.innerHTML = "<div style='padding:16px;font-family:Arial,sans-serif;color:#b00020;'>Rows were received from Looker, but none were parsed successfully.</div>";
+    return;
+  }
+
+  if (!laneNames.length) {
+    container.innerHTML = "<div style='padding:16px;font-family:Arial,sans-serif;color:#b00020;'>Rows were parsed, but no lane names were found.</div>";
     return;
   }
 
@@ -640,11 +692,11 @@ function renderLookerViz(data, element, config, queryResponse) {
 
   const leftPad = 120;
   const rightPad = 120;
-  const topPad = 110;
+  const topPad = 120;
   const laneTopY = topPad;
   const firstRowY = laneTopY + 45;
   const chartWidth = leftPad + rightPad + (laneNames.length * layout.laneSpacing * 0.8) + 200;
-  const chartHeight = firstRowY + (rows.length * layout.rowSpacing * 0.7) + 90;
+  const chartHeight = firstRowY + (rows.length * layout.rowSpacing * 0.7) + 100;
   const bottomY = firstRowY + (rows.length - 1) * layout.rowSpacing * 0.7 + 30;
   const scale = 1.03;
 
