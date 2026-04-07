@@ -1,0 +1,619 @@
+looker.plugins.visualizations.add({
+  id: "network_sequence_trace",
+  label: "Network Sequence Trace",
+
+  options: {
+    lane_order: {
+      type: "string",
+      label: "Lane Order",
+      section: "Layout",
+      order: 1,
+      display: "text",
+      default: "UE1,P-CSCF,GNB,AMF,MME,SGW,UE2"
+    },
+    lane_spacing: {
+      type: "number",
+      label: "Lane Spacing",
+      section: "Layout",
+      order: 2,
+      default: 150
+    },
+    row_spacing: {
+      type: "number",
+      label: "Row Spacing",
+      section: "Layout",
+      order: 3,
+      default: 70
+    },
+    show_tooltips: {
+      type: "boolean",
+      label: "Show Tooltips",
+      section: "Layout",
+      order: 4,
+      default: true
+    }
+  },
+
+  create: function (element) {
+    element.innerHTML = `
+      <style>
+        html, body {
+          margin: 0;
+          padding: 0;
+        }
+        .network-sequence-trace-root {
+          width: 100%;
+          height: 100%;
+          overflow: auto;
+          background: #ffffff;
+          font-family: Arial, sans-serif;
+        }
+      </style>
+      <div id="viz" class="network-sequence-trace-root"></div>
+    `;
+  },
+
+  updateAsync: function (data, element, config, queryResponse, details, doneRendering) {
+    try {
+      renderLookerViz(data, element, config || {});
+      doneRendering();
+    } catch (err) {
+      const container = element.querySelector("#viz");
+      if (container) {
+        container.innerHTML = `<div style="padding:16px;color:#b00020;font-family:Arial,sans-serif;">Visualization error: ${err.message}</div>`;
+      }
+      console.error(err);
+      doneRendering();
+    }
+  }
+});
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+const DEFAULT_STYLE = {
+  laneSpacing: 150,
+  rowSpacing: 70,
+  showTooltips: true
+};
+
+function parseLaneOrderConfig(value) {
+  if (!value) {
+    return ["UE1", "P-CSCF", "GNB", "AMF", "MME", "SGW", "UE2"];
+  }
+
+  return String(value)
+    .split(",")
+    .map(v => v.trim())
+    .filter(Boolean)
+    .map(v => v.toUpperCase());
+}
+
+function getLayoutConfig(config) {
+  const laneSpacing = Number(config.lane_spacing);
+  const rowSpacing = Number(config.row_spacing);
+
+  return {
+    laneOrder: parseLaneOrderConfig(config.lane_order),
+    laneSpacing: Number.isFinite(laneSpacing) ? laneSpacing : DEFAULT_STYLE.laneSpacing,
+    rowSpacing: Number.isFinite(rowSpacing) ? rowSpacing : DEFAULT_STYLE.rowSpacing,
+    showTooltips: config.show_tooltips !== false
+  };
+}
+
+function parseTimestamp(value) {
+  if (!value) return null;
+
+  const direct = new Date(value);
+  if (!isNaN(direct.getTime())) return direct;
+
+  const normalized = String(value).replace(" ", "T");
+  const fallback = new Date(normalized);
+  if (!isNaN(fallback.getTime())) return fallback;
+
+  return null;
+}
+
+function formatFullTimestamp(value) {
+  const d = parseTimestamp(value);
+  if (!d) return value || "";
+
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+  const month = months[d.getMonth()];
+  const day = d.getDate();
+  const year = d.getFullYear();
+
+  let hours = d.getHours();
+  const minutes = String(d.getMinutes()).padStart(2, "0");
+  const seconds = String(d.getSeconds()).padStart(2, "0");
+  const ampm = hours >= 12 ? "PM" : "AM";
+
+  hours = hours % 12;
+  if (hours === 0) hours = 12;
+
+  return `${month} ${day}, ${year}, ${hours}:${minutes}:${seconds} ${ampm}`;
+}
+
+function formatElapsed(seconds) {
+  if (seconds == null || isNaN(seconds) || seconds < 0) return "";
+
+  const rounded = Math.round(seconds);
+
+  if (rounded <= 1) return "+1 sec";
+  if (rounded < 60) return `+${rounded} sec`;
+
+  const mins = Math.floor(rounded / 60);
+  const secs = rounded % 60;
+
+  if (secs === 0) {
+    return mins === 1 ? "+1 min" : `+${mins} min`;
+  }
+
+  return `+${mins}m ${secs}s`;
+}
+
+function escapeText(v) {
+  return v == null ? "" : String(v);
+}
+
+function normalizeNode(v) {
+  if (!v) return "";
+  return String(v).trim().toUpperCase();
+}
+
+function hasRealRemark(v) {
+  if (v == null) return false;
+  const s = String(v).trim();
+  if (s === "") return false;
+  if (s.toLowerCase() === "null") return false;
+  return true;
+}
+
+function createSvgEl(name, attrs = {}) {
+  const el = document.createElementNS(SVG_NS, name);
+  Object.entries(attrs).forEach(([k, v]) => el.setAttribute(k, v));
+  return el;
+}
+
+function clearElement(el) {
+  while (el.firstChild) el.removeChild(el.firstChild);
+}
+
+function cellToString(cell) {
+  if (cell == null) return "";
+  if (typeof cell !== "object") return String(cell);
+  if (cell.rendered != null && cell.rendered !== "") return String(cell.rendered);
+  if (cell.value != null && cell.value !== "") return String(cell.value);
+  return "";
+}
+
+function getRowValue(row, aliases) {
+  const keys = Object.keys(row || {});
+
+  for (const alias of aliases) {
+    if (row[alias] != null) return cellToString(row[alias]);
+  }
+
+  for (const key of keys) {
+    const lowerKey = key.toLowerCase();
+    for (const alias of aliases) {
+      const lowerAlias = alias.toLowerCase();
+      if (lowerKey === lowerAlias || lowerKey.endsWith("." + lowerAlias)) {
+        return cellToString(row[key]);
+      }
+    }
+  }
+
+  return "";
+}
+
+function buildLaneNames(nodeSet, configuredOrder) {
+  const laneNames = configuredOrder.filter(name => nodeSet.has(name));
+  Array.from(nodeSet).forEach(name => {
+    if (!laneNames.includes(name)) laneNames.push(name);
+  });
+  return laneNames;
+}
+
+function getLookerRows(data, config) {
+  const rows = data.map(r => ({
+    source_number: escapeText(getRowValue(r, ["source_number"])),
+    event_name: escapeText(getRowValue(r, ["event_name"])),
+    start_ts_raw: escapeText(getRowValue(r, ["start_ts", "start_timestamp", "timestamp"])),
+    rat_name: escapeText(getRowValue(r, ["rat_name", "rat"])),
+    cell_id: escapeText(getRowValue(r, ["cell_id", "cell"])),
+    source_node: normalizeNode(getRowValue(r, ["source_node", "src_node", "from_node"])),
+    destination_node: normalizeNode(getRowValue(r, ["destination_node", "dst_node", "to_node"])),
+    remarks: escapeText(getRowValue(r, ["remarks", "remark"])),
+    calling_final_call_label: escapeText(getRowValue(r, ["calling_final_call_label", "calling_label"])),
+    called_final_call_label: escapeText(getRowValue(r, ["called_final_call_label", "called_label"])),
+    tooltip: escapeText(getRowValue(r, ["tooltip", "details", "description"]))
+  }));
+
+  const nodeSet = new Set();
+  rows.forEach(r => {
+    if (r.source_node) nodeSet.add(r.source_node);
+    if (r.destination_node) nodeSet.add(r.destination_node);
+  });
+
+  const layout = getLayoutConfig(config || {});
+  const laneNames = buildLaneNames(nodeSet, layout.laneOrder);
+
+  const laneIndex = {};
+  laneNames.forEach((name, idx) => {
+    laneIndex[name] = idx;
+  });
+
+  const enriched = rows.map(r => ({
+    ...r,
+    start_ts: parseTimestamp(r.start_ts_raw),
+    from: laneIndex[r.source_node] != null ? Number(laneIndex[r.source_node]) : null,
+    to: laneIndex[r.destination_node] != null ? Number(laneIndex[r.destination_node]) : null
+  }));
+
+  enriched.sort((a, b) => {
+    if (a.start_ts && b.start_ts) return a.start_ts - b.start_ts;
+    if (a.start_ts && !b.start_ts) return -1;
+    if (!a.start_ts && b.start_ts) return 1;
+    return a.event_name.localeCompare(b.event_name);
+  });
+
+  let prevTs = null;
+  enriched.forEach((r, idx) => {
+    let elapsedSec = null;
+    let elapsedLabel = "";
+
+    if (prevTs && r.start_ts) {
+      elapsedSec = (r.start_ts - prevTs) / 1000;
+      elapsedLabel = formatElapsed(elapsedSec);
+    }
+
+    r.rowIndex = idx;
+    r.elapsedSec = elapsedSec;
+    r.elapsedLabel = elapsedLabel;
+
+    if (r.start_ts) prevTs = r.start_ts;
+  });
+
+  return {
+    rows: enriched,
+    laneNames
+  };
+}
+
+function addTitle(svg, sourceNumber, callingLabel, calledLabel) {
+  const title = createSvgEl("text", {
+    x: 20,
+    y: 28,
+    "font-size": 20,
+    "font-weight": "700",
+    fill: "#222"
+  });
+  title.textContent = sourceNumber ? `Call Sequence | ${sourceNumber}` : "Call Sequence";
+  svg.appendChild(title);
+
+  const badge1 = createSvgEl("rect", {
+    x: 20,
+    y: 42,
+    rx: 4,
+    ry: 4,
+    width: 170,
+    height: 24,
+    fill: "#dceeff",
+    stroke: "#9fc5e8"
+  });
+  svg.appendChild(badge1);
+
+  const badge1Text = createSvgEl("text", {
+    x: 30,
+    y: 58,
+    "font-size": 12,
+    fill: "#222"
+  });
+  badge1Text.textContent = `Calling: ${callingLabel || "-"}`;
+  svg.appendChild(badge1Text);
+
+  const badge2 = createSvgEl("rect", {
+    x: 205,
+    y: 42,
+    rx: 4,
+    ry: 4,
+    width: 170,
+    height: 24,
+    fill: "#e9f7df",
+    stroke: "#b6d7a8"
+  });
+  svg.appendChild(badge2);
+
+  const badge2Text = createSvgEl("text", {
+    x: 215,
+    y: 58,
+    "font-size": 12,
+    fill: "#222"
+  });
+  badge2Text.textContent = `Called: ${calledLabel || "-"}`;
+  svg.appendChild(badge2Text);
+}
+
+function drawLanes(svg, laneNames, laneX, topY, bottomY) {
+  laneNames.forEach((name, idx) => {
+    const x = laneX[idx];
+
+    const line = createSvgEl("line", {
+      x1: x,
+      y1: topY,
+      x2: x,
+      y2: bottomY,
+      stroke: "#b7b7b7",
+      "stroke-width": 1,
+      "stroke-dasharray": "4,4"
+    });
+    svg.appendChild(line);
+
+    const topBox = createSvgEl("rect", {
+      x: x - 45,
+      y: topY - 34,
+      width: 90,
+      height: 24,
+      rx: 5,
+      ry: 5,
+      fill: "#f5f5f5",
+      stroke: "#d0d0d0"
+    });
+    svg.appendChild(topBox);
+
+    const topText = createSvgEl("text", {
+      x: x,
+      y: topY - 18,
+      "text-anchor": "middle",
+      "font-size": 12,
+      "font-weight": "600",
+      fill: "#222"
+    });
+    topText.textContent = name;
+    svg.appendChild(topText);
+
+    const bottomBox = createSvgEl("rect", {
+      x: x - 45,
+      y: bottomY + 10,
+      width: 90,
+      height: 24,
+      rx: 5,
+      ry: 5,
+      fill: "#f5f5f5",
+      stroke: "#d0d0d0"
+    });
+    svg.appendChild(bottomBox);
+
+    const bottomText = createSvgEl("text", {
+      x: x,
+      y: bottomY + 26,
+      "text-anchor": "middle",
+      "font-size": 12,
+      "font-weight": "600",
+      fill: "#222"
+    });
+    bottomText.textContent = name;
+    svg.appendChild(bottomText);
+  });
+}
+
+function addTooltip(el, text, enabled) {
+  if (!enabled || !text) return;
+  const title = createSvgEl("title");
+  title.textContent = text;
+  el.appendChild(title);
+}
+
+function drawSameLaneEvent(svg, row, x, y, showTooltips) {
+  const g = createSvgEl("g");
+
+  const tsText = createSvgEl("text", {
+    x: 20,
+    y: y + 4,
+    "font-size": 9,
+    fill: "#444"
+  });
+  tsText.textContent = formatFullTimestamp(row.start_ts_raw);
+  g.appendChild(tsText);
+
+  const path = createSvgEl("path", {
+    d: `M ${x} ${y}
+        C ${x + 34} ${y}, ${x + 34} ${y + 28}, ${x} ${y + 28}
+        C ${x - 18} ${y + 28}, ${x - 18} ${y + 8}, ${x} ${y + 8}`,
+    fill: "none",
+    stroke: "#333",
+    "stroke-width": 2
+  });
+  g.appendChild(path);
+
+  const arrowHead = createSvgEl("polygon", {
+    points: `${x},${y + 8} ${x - 8},${y + 4} ${x - 8},${y + 12}`,
+    fill: "#333"
+  });
+  g.appendChild(arrowHead);
+
+  const eventText = createSvgEl("text", {
+    x: x + 40,
+    y: y + 12,
+    "font-size": 10,
+    "font-weight": "600",
+    fill: "#222"
+  });
+  eventText.textContent = row.event_name || "";
+  g.appendChild(eventText);
+
+  const metaText = createSvgEl("text", {
+    x: x + 40,
+    y: y + 28,
+    "font-size": 9,
+    fill: "#666"
+  });
+  metaText.textContent = [row.rat_name, row.cell_id].filter(Boolean).join(" | ");
+  g.appendChild(metaText);
+
+  if (hasRealRemark(row.remarks)) {
+    const remarkText = createSvgEl("text", {
+      x: x + 40,
+      y: y + 42,
+      "font-size": 9,
+      fill: "red"
+    });
+    remarkText.textContent = row.remarks;
+    g.appendChild(remarkText);
+  }
+
+  if (row.elapsedLabel) {
+    const elapsed = createSvgEl("text", {
+      x: x - 14,
+      y: y + 18,
+      "font-size": 9,
+      fill: "#8a6d00",
+      "text-anchor": "end"
+    });
+    elapsed.textContent = row.elapsedLabel;
+    g.appendChild(elapsed);
+  }
+
+  addTooltip(g, row.tooltip || row.event_name, showTooltips);
+  svg.appendChild(g);
+}
+
+function drawCrossLaneEvent(svg, row, x1, x2, y, showTooltips) {
+  const g = createSvgEl("g");
+
+  const tsText = createSvgEl("text", {
+    x: 20,
+    y: y + 4,
+    "font-size": 9,
+    fill: "#444"
+  });
+  tsText.textContent = formatFullTimestamp(row.start_ts_raw);
+  g.appendChild(tsText);
+
+  const line = createSvgEl("line", {
+    x1: x1,
+    y1: y,
+    x2: x2,
+    y2: y,
+    stroke: "#333",
+    "stroke-width": 2
+  });
+  g.appendChild(line);
+
+  const dir = x2 >= x1 ? 1 : -1;
+  const arrowHead = createSvgEl("polygon", {
+    points: `${x2},${y} ${x2 - 10 * dir},${y - 5} ${x2 - 10 * dir},${y + 5}`,
+    fill: "#333"
+  });
+  g.appendChild(arrowHead);
+
+  const left = Math.min(x1, x2);
+
+  const eventText = createSvgEl("text", {
+    x: left + 8,
+    y: y - 12,
+    "font-size": 10,
+    "font-weight": "600",
+    fill: "#222"
+  });
+  eventText.textContent = row.event_name || "";
+  g.appendChild(eventText);
+
+  const metaText = createSvgEl("text", {
+    x: left + 8,
+    y: y + 15,
+    "font-size": 9,
+    fill: "#666"
+  });
+  metaText.textContent = [row.rat_name, row.cell_id].filter(Boolean).join(" | ");
+  g.appendChild(metaText);
+
+  if (hasRealRemark(row.remarks)) {
+    const remarkText = createSvgEl("text", {
+      x: left + 8,
+      y: y + 30,
+      "font-size": 9,
+      fill: "red"
+    });
+    remarkText.textContent = row.remarks;
+    g.appendChild(remarkText);
+  }
+
+  if (row.elapsedLabel) {
+    const elapsed = createSvgEl("text", {
+      x: (x1 + x2) / 2,
+      y: y - 26,
+      "font-size": 9,
+      fill: "#8a6d00",
+      "text-anchor": "middle"
+    });
+    elapsed.textContent = row.elapsedLabel;
+    g.appendChild(elapsed);
+  }
+
+  addTooltip(g, row.tooltip || row.event_name, showTooltips);
+  svg.appendChild(g);
+}
+
+function renderLookerViz(data, element, config) {
+  const container = element.querySelector("#viz");
+  clearElement(container);
+
+  const layout = getLayoutConfig(config || {});
+  const parsed = getLookerRows(data, config || {});
+  const rows = parsed.rows;
+  const laneNames = parsed.laneNames;
+
+  if (!rows.length || !laneNames.length) {
+    container.innerHTML = "<div style='padding:16px;font-family:Arial,sans-serif;'>No data available.</div>";
+    return;
+  }
+
+  const sourceNumber = rows[0].source_number || "";
+  const callingLabel = rows[0].calling_final_call_label || "";
+  const calledLabel = rows[0].called_final_call_label || "";
+
+  const leftPad = 120;
+  const rightPad = 120;
+  const topPad = 110;
+  const laneTopY = topPad;
+  const firstRowY = laneTopY + 45;
+  const chartWidth = leftPad + rightPad + (laneNames.length * layout.laneSpacing * 0.8) + 200;
+  const chartHeight = firstRowY + (rows.length * layout.rowSpacing * 0.7) + 90;
+  const bottomY = firstRowY + (rows.length - 1) * layout.rowSpacing + 30;
+  const scale = 1.03;
+
+  const svg = createSvgEl("svg", {
+    width: chartWidth * scale,
+    height: chartHeight * scale,
+    viewBox: `0 0 ${chartWidth} ${chartHeight}`,
+    preserveAspectRatio: "xMinYMin meet",
+    style: "font-family: Arial, sans-serif; background: white; display: block;"
+  });
+
+  addTitle(svg, sourceNumber, callingLabel, calledLabel);
+
+  const laneX = laneNames.map((name, idx) =>
+    leftPad + idx * (layout.laneSpacing * 0.8) + 80
+  );
+
+  drawLanes(svg, laneNames, laneX, laneTopY, bottomY);
+
+  rows.forEach((row, idx) => {
+    if (row.from == null || row.to == null) return;
+
+    const y = firstRowY + idx * (layout.rowSpacing * 0.7);
+    const x1 = laneX[Number(row.from)];
+    const x2 = laneX[Number(row.to)];
+
+    if (row.from === row.to) {
+      drawSameLaneEvent(svg, row, x1, y, layout.showTooltips);
+    } else {
+      drawCrossLaneEvent(svg, row, x1, x2, y, layout.showTooltips);
+    }
+  });
+
+  container.appendChild(svg);
+}
