@@ -60,7 +60,7 @@ looker.plugins.visualizations.add({
     } catch (err) {
       const container = element.querySelector("#viz");
       if (container) {
-        container.innerHTML = `<div style="padding:16px;color:#b00020;font-family:Arial,sans-serif;">Visualization error: ${err.message}</div>`;
+        container.innerHTML = `<div style="padding:16px;color:#b00020;font-family:Arial,sans-serif;white-space:pre-wrap;">Visualization error: ${err.message}</div>`;
       }
       console.error(err);
       doneRendering();
@@ -75,6 +75,9 @@ const DEFAULT_STYLE = {
   rowSpacing: 70,
   showTooltips: true
 };
+
+const REQUIRED_SEQUENCE_TEXT =
+  "Expected field sequence: call_flow_label (or source_number), event_name, start_ts (or start_ts_time / start ts time), rat_name, cell_id, source_node, destination_node, remarks, calling_final_call_label, called_final_call_label, <tooltip field immediately after called_final_call_label>.";
 
 function parseLaneOrderConfig(value) {
   if (!value) {
@@ -157,26 +160,6 @@ function escapeText(v) {
   return v == null ? "" : String(v);
 }
 
-function getOrderedFieldNames(queryResponse) {
-  const dims = (queryResponse.fields && queryResponse.fields.dimension_like) || [];
-  return dims.map(f => f.name);
-}
-
-function findTooltipFieldName(queryResponse) {
-  const ordered = getOrderedFieldNames(queryResponse);
-
-  const idx = ordered.findIndex(name => {
-    const lower = name.toLowerCase();
-    return lower === "called_final_call_label" || lower.endsWith(".called_final_call_label");
-  });
-
-  if (idx >= 0 && idx + 1 < ordered.length) {
-    return ordered[idx + 1];
-  }
-
-  return null;
-}
-
 function normalizeNode(v) {
   if (!v) return "";
   return String(v).trim().toUpperCase();
@@ -208,24 +191,82 @@ function cellToString(cell) {
   return "";
 }
 
-function getRowValue(row, aliases) {
-  const keys = Object.keys(row || {});
+function leafFieldName(name) {
+  if (!name) return "";
+  const parts = String(name).split(".");
+  return parts[parts.length - 1];
+}
 
-  for (const alias of aliases) {
-    if (row[alias] != null) return cellToString(row[alias]);
-  }
+function normalizeFieldToken(name) {
+  return leafFieldName(name).toLowerCase().replace(/[^a-z0-9]/g, "");
+}
 
-  for (const key of keys) {
-    const lowerKey = key.toLowerCase();
-    for (const alias of aliases) {
-      const lowerAlias = alias.toLowerCase();
-      if (lowerKey === lowerAlias || lowerKey.endsWith("." + lowerAlias)) {
-        return cellToString(row[key]);
-      }
+function fieldMatches(actualFieldName, aliases, allowTimeSuffix) {
+  const actual = normalizeFieldToken(actualFieldName);
+
+  return aliases.some(alias => {
+    const base = normalizeFieldToken(alias);
+    if (actual === base) return true;
+    if (allowTimeSuffix && actual === `${base}time`) return true;
+    return false;
+  });
+}
+
+function getOrderedFieldNames(queryResponse) {
+  const dims = (queryResponse.fields && queryResponse.fields.dimension_like) || [];
+  const measures = (queryResponse.fields && queryResponse.fields.measure_like) || [];
+  return [...dims, ...measures].map(f => f.name);
+}
+
+function findMatchingFieldName(queryResponse, aliases, allowTimeSuffix = false) {
+  const ordered = getOrderedFieldNames(queryResponse);
+  return ordered.find(name => fieldMatches(name, aliases, allowTimeSuffix)) || null;
+}
+
+function resolveFieldMap(queryResponse) {
+  const requiredDefs = [
+    { key: "source_number", aliases: ["call_flow_label", "source_number"], allowTimeSuffix: false },
+    { key: "event_name", aliases: ["event_name"], allowTimeSuffix: false },
+    { key: "start_ts_raw", aliases: ["start_ts"], allowTimeSuffix: true },
+    { key: "rat_name", aliases: ["rat_name"], allowTimeSuffix: false },
+    { key: "cell_id", aliases: ["cell_id"], allowTimeSuffix: false },
+    { key: "source_node", aliases: ["source_node"], allowTimeSuffix: false },
+    { key: "destination_node", aliases: ["destination_node"], allowTimeSuffix: false },
+    { key: "remarks", aliases: ["remarks"], allowTimeSuffix: false },
+    { key: "calling_final_call_label", aliases: ["calling_final_call_label"], allowTimeSuffix: false },
+    { key: "called_final_call_label", aliases: ["called_final_call_label"], allowTimeSuffix: false }
+  ];
+
+  const fieldMap = {};
+  const unmatched = [];
+
+  requiredDefs.forEach(def => {
+    const matched = findMatchingFieldName(queryResponse, def.aliases, def.allowTimeSuffix);
+    if (!matched) {
+      unmatched.push(def.aliases[0]);
+    } else {
+      fieldMap[def.key] = matched;
     }
+  });
+
+  if (unmatched.length) {
+    throw new Error(
+      `Unmatched required field(s): ${unmatched.join(", ")}.\n${REQUIRED_SEQUENCE_TEXT}`
+    );
   }
 
-  return "";
+  const ordered = getOrderedFieldNames(queryResponse);
+  const calledIdx = ordered.findIndex(name => name === fieldMap.called_final_call_label);
+
+  if (calledIdx < 0 || calledIdx + 1 >= ordered.length) {
+    throw new Error(
+      `Unmatched tooltip field: no field found immediately after called_final_call_label.\n${REQUIRED_SEQUENCE_TEXT}`
+    );
+  }
+
+  fieldMap.tooltip = ordered[calledIdx + 1];
+
+  return fieldMap;
 }
 
 function buildLaneNames(nodeSet, configuredOrder) {
@@ -236,22 +277,22 @@ function buildLaneNames(nodeSet, configuredOrder) {
   return laneNames;
 }
 
-
 function getLookerRows(data, config, queryResponse) {
-  const tooltipFieldName = findTooltipFieldName(queryResponse);
+  const fieldMap = resolveFieldMap(queryResponse);
+
   const rows = data.map(r => ({
-  source_number: escapeText(getRowValue(r, ["call_flow_label"])),
-  event_name: escapeText(getRowValue(r, ["event_name"])),
-  start_ts_raw: escapeText(getRowValue(r, ["start_ts", "start_timestamp", "timestamp"])),
-  rat_name: escapeText(getRowValue(r, ["rat_name", "rat"])),
-  cell_id: escapeText(getRowValue(r, ["cell_id", "cell"])),
-  source_node: normalizeNode(getRowValue(r, ["source_node", "src_node", "from_node"])),
-  destination_node: normalizeNode(getRowValue(r, ["destination_node", "dst_node", "to_node"])),
-  remarks: escapeText(getRowValue(r, ["remarks", "remark"])),
-  calling_final_call_label: escapeText(getRowValue(r, ["calling_final_call_label", "calling_label"])),
-  called_final_call_label: escapeText(getRowValue(r, ["called_final_call_label", "called_label"])),
-  tooltip: tooltipFieldName ? escapeText(cellToString(r[tooltipFieldName])) : ""
-}));
+    source_number: escapeText(cellToString(r[fieldMap.source_number])),
+    event_name: escapeText(cellToString(r[fieldMap.event_name])),
+    start_ts_raw: escapeText(cellToString(r[fieldMap.start_ts_raw])),
+    rat_name: escapeText(cellToString(r[fieldMap.rat_name])),
+    cell_id: escapeText(cellToString(r[fieldMap.cell_id])),
+    source_node: normalizeNode(cellToString(r[fieldMap.source_node])),
+    destination_node: normalizeNode(cellToString(r[fieldMap.destination_node])),
+    remarks: escapeText(cellToString(r[fieldMap.remarks])),
+    calling_final_call_label: escapeText(cellToString(r[fieldMap.calling_final_call_label])),
+    called_final_call_label: escapeText(cellToString(r[fieldMap.called_final_call_label])),
+    tooltip: escapeText(cellToString(r[fieldMap.tooltip]))
+  }));
 
   const nodeSet = new Set();
   rows.forEach(r => {
@@ -424,7 +465,7 @@ function drawLanes(svg, laneNames, laneX, topY, bottomY) {
 function addTooltip(el, text, enabled) {
   if (!enabled || !text) return;
   const title = createSvgEl("title");
-  title.textContent = text;
+  title.textContent = String(text);
   el.appendChild(title);
 }
 
@@ -604,7 +645,7 @@ function renderLookerViz(data, element, config, queryResponse) {
   const firstRowY = laneTopY + 45;
   const chartWidth = leftPad + rightPad + (laneNames.length * layout.laneSpacing * 0.8) + 200;
   const chartHeight = firstRowY + (rows.length * layout.rowSpacing * 0.7) + 90;
-  const bottomY = firstRowY + (rows.length - 1) * layout.rowSpacing + 30;
+  const bottomY = firstRowY + (rows.length - 1) * layout.rowSpacing * 0.7 + 30;
   const scale = 1.03;
 
   const svg = createSvgEl("svg", {
