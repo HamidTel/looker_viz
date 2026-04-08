@@ -83,7 +83,7 @@ const DEFAULT_STYLE = {
 
 const REQUIRED_SEQUENCE_TEXT =
   "Expected field order:\n" +
-  "1. call_flow_label (or source_number)\n" +
+  "1. call_flow_label\n" +
   "2. event_name\n" +
   "3. start_ts (or start_ts_time / start ts time)\n" +
   "4. rat_name\n" +
@@ -257,7 +257,7 @@ function findMatchingFieldName(queryResponse, aliases, allowTimeSuffix = false) 
 
 function resolveFieldMap(queryResponse) {
   const requiredDefs = [
-    { key: "call_flow_label", aliases: ["call_flow_label", "source_number"], allowTimeSuffix: false },
+    { key: "call_flow_label", aliases: ["call_flow_label"], allowTimeSuffix: false },
     { key: "event_name", aliases: ["event_name"], allowTimeSuffix: false },
     { key: "start_ts_raw", aliases: ["start_ts"], allowTimeSuffix: true },
     { key: "rat_name", aliases: ["rat_name"], allowTimeSuffix: false },
@@ -385,7 +385,7 @@ function getLookerRows(data, config, queryResponse) {
   };
 }
 
-function addTitle(svg, sourceNumber, callingLabel, calledLabel) {
+function addTitle(svg, callFlowLabel, callingLabel, calledLabel) {
   const title = createSvgEl("text", {
     x: 20,
     y: 28,
@@ -393,7 +393,7 @@ function addTitle(svg, sourceNumber, callingLabel, calledLabel) {
     "font-weight": "700",
     fill: "#222"
   });
-  title.textContent = sourceNumber ? `Event Sequence V1.0 | ${sourceNumber}` : "Event Sequence V1.0";
+  title.textContent = callFlowLabel ? `Event Sequence V1.0 | ${callFlowLabel}` : "Event Sequence V1.0";
   svg.appendChild(title);
 
   const authorText = createSvgEl("text", {
@@ -698,7 +698,7 @@ function renderLookerViz(data, element, config, queryResponse) {
     return;
   }
 
-  const call_flow_label = rows[0].call_flow_label || "";
+  const callFlowLabel = rows[0].call_flow_label || "";
   const callingLabel = rows[0].calling_final_call_label || "";
   const calledLabel = rows[0].called_final_call_label || "";
 
@@ -720,7 +720,7 @@ function renderLookerViz(data, element, config, queryResponse) {
     style: "font-family: Arial, sans-serif; background: white; display: block;"
   });
 
-  addTitle(svg, sourceNumber, callingLabel, calledLabel);
+  addTitle(svg, callFlowLabel, callingLabel, calledLabel);
 
   const laneX = laneNames.map((name, idx) =>
     leftPad + idx * (layout.laneSpacing * 0.8) + 80
