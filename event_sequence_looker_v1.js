@@ -64,7 +64,7 @@ looker.plugins.visualizations.add({
       container.innerHTML = `
   <div style="padding:20px;font-family:Arial,sans-serif;color:#b00020;line-height:1.5;white-space:pre-wrap;">
     <div style="font-weight:700;font-size:16px;margin-bottom:10px;">Visualization Error</div>
-    <div style="font-size:13px;">${err && err.message ? err.message : String(err)}</div>
+    <div style="font-size":13px;">${err && err.message ? err.message : String(err)}</div>
   </div>
 `;
       console.error(err);
@@ -93,7 +93,8 @@ const REQUIRED_SEQUENCE_TEXT =
   "8. remarks\n" +
   "9. calling_final_call_label\n" +
   "10. called_final_call_label\n" +
-  "11. tooltip field immediately after called_final_call_label";
+  "11. time_since_invite (optional for elapsed display)\n" +
+  "12. tooltip field immediately after called_final_call_label";
 
 function parseLaneOrderConfig(value) {
   if (!value) {
@@ -155,9 +156,12 @@ function formatFullTimestamp(value) {
 }
 
 function formatElapsed(seconds) {
-  if (seconds == null || isNaN(seconds) || seconds < 0) return "";
+  if (seconds == null || seconds === "") return "";
 
-  const rounded = Math.round(seconds);
+  const numeric = Number(seconds);
+  if (!Number.isFinite(numeric) || numeric < 0) return "";
+
+  const rounded = Math.round(numeric);
 
   if (rounded <= 1) return "+1 sec";
   if (rounded < 60) return `+${rounded} sec`;
@@ -187,6 +191,63 @@ function hasRealRemark(v) {
   if (s === "") return false;
   if (s.toLowerCase() === "null") return false;
   return true;
+}
+
+function getEventArrowColors(row) {
+  const name = String(row.event_name || "").toLowerCase();
+
+  if (name.includes("calling")) {
+    return {
+      stroke: "#2b6cb0",
+      fill: "#2b6cb0"
+    };
+  }
+
+  if (name.includes("called")) {
+    return {
+      stroke: "#2f855a",
+      fill: "#2f855a"
+    };
+  }
+
+  return {
+    stroke: "#333",
+    fill: "#333"
+  };
+}
+
+function getEventSortPriority(eventName) {
+  const name = String(eventName || "").trim().toLowerCase();
+
+  const order = [
+    "calling invite",
+    "called invite",
+    "calling ngap modify - epsfb",
+    "calling create first bearer",
+    "calling create bearer failed first",
+    "calling create bearer last",
+    "calling create bearer failed last",
+    "calling asr",
+    "called asr",
+    "calling bye",
+    "called bye"
+  ];
+
+  const idx = order.indexOf(name);
+  return idx >= 0 ? idx : 999;
+}
+
+function getEventPresence(rows) {
+  let hasCalling = false;
+  let hasCalled = false;
+
+  rows.forEach(row => {
+    const name = String(row.event_name || "").toLowerCase();
+    if (name.includes("calling")) hasCalling = true;
+    if (name.includes("called")) hasCalled = true;
+  });
+
+  return { hasCalling, hasCalled };
 }
 
 function createSvgEl(name, attrs = {}) {
@@ -264,7 +325,7 @@ function resolveFieldMap(queryResponse) {
     { key: "cell_id", aliases: ["cell_id"], allowTimeSuffix: false },
     { key: "source_node", aliases: ["source_node"], allowTimeSuffix: false },
     { key: "destination_node", aliases: ["destination_node"], allowTimeSuffix: false },
-    { key: "remarks", aliases: ["remarks","remarks_styled"], allowTimeSuffix: false },
+    { key: "remarks", aliases: ["remarks", "remarks_styled"], allowTimeSuffix: false },
     { key: "calling_final_call_label", aliases: ["calling_final_call_label"], allowTimeSuffix: false },
     { key: "called_final_call_label", aliases: ["called_final_call_label"], allowTimeSuffix: false }
   ];
@@ -286,6 +347,10 @@ function resolveFieldMap(queryResponse) {
       `Unmatched required field(s): ${unmatched.join(", ")}.\n${REQUIRED_SEQUENCE_TEXT}`
     );
   }
+
+  // optional field for elapsed display
+  const timeSinceInviteField = findMatchingFieldName(queryResponse, ["time_since_invite"], false);
+  fieldMap.time_since_invite = timeSinceInviteField || null;
 
   const ordered = getOrderedFieldNames(queryResponse);
   const calledIdx = ordered.findIndex(name => name === fieldMap.called_final_call_label);
@@ -323,7 +388,8 @@ function getLookerRows(data, config, queryResponse) {
     remarks: escapeText(cellToString(r[fieldMap.remarks])),
     calling_final_call_label: escapeText(cellToString(r[fieldMap.calling_final_call_label])),
     called_final_call_label: escapeText(cellToString(r[fieldMap.called_final_call_label])),
-    tooltip: escapeText(cellToString(r[fieldMap.tooltip]))
+    tooltip: escapeText(cellToString(r[fieldMap.tooltip])),
+    time_since_invite: fieldMap.time_since_invite ? escapeText(cellToString(r[fieldMap.time_since_invite])) : ""
   }));
 
   if (!rows.length) {
@@ -352,31 +418,32 @@ function getLookerRows(data, config, queryResponse) {
     ...r,
     start_ts: parseTimestamp(r.start_ts_raw),
     from: laneIndex[r.source_node] != null ? Number(laneIndex[r.source_node]) : null,
-    to: laneIndex[r.destination_node] != null ? Number(laneIndex[r.destination_node]) : null
+    to: laneIndex[r.destination_node] != null ? Number(laneIndex[r.destination_node]) : null,
+    elapsedLabel: formatElapsed(r.time_since_invite)
   }));
 
   enriched.sort((a, b) => {
-    if (a.start_ts && b.start_ts) return a.start_ts - b.start_ts;
+    if (a.start_ts && b.start_ts) {
+      const timeDiff = a.start_ts - b.start_ts;
+      if (timeDiff !== 0) return timeDiff;
+
+      const priorityDiff = getEventSortPriority(a.event_name) - getEventSortPriority(b.event_name);
+      if (priorityDiff !== 0) return priorityDiff;
+
+      return a.event_name.localeCompare(b.event_name);
+    }
+
     if (a.start_ts && !b.start_ts) return -1;
     if (!a.start_ts && b.start_ts) return 1;
+
+    const priorityDiff = getEventSortPriority(a.event_name) - getEventSortPriority(b.event_name);
+    if (priorityDiff !== 0) return priorityDiff;
+
     return a.event_name.localeCompare(b.event_name);
   });
 
-  let prevTs = null;
   enriched.forEach((r, idx) => {
-    let elapsedSec = null;
-    let elapsedLabel = "";
-
-    if (prevTs && r.start_ts) {
-      elapsedSec = (r.start_ts - prevTs) / 1000;
-      elapsedLabel = formatElapsed(elapsedSec);
-    }
-
     r.rowIndex = idx;
-    r.elapsedSec = elapsedSec;
-    r.elapsedLabel = elapsedLabel;
-
-    if (r.start_ts) prevTs = r.start_ts;
   });
 
   return {
@@ -385,13 +452,13 @@ function getLookerRows(data, config, queryResponse) {
   };
 }
 
-function addTitle(svg, callFlowLabel, callingLabel, calledLabel) {
+function addTitle(svg, callFlowLabel, callingLabel, calledLabel, eventPresence) {
   const title = createSvgEl("text", {
     x: 20,
     y: 28,
     "font-size": 20,
     "font-weight": "700",
-    fill: "#222"
+    fill: "#000"
   });
   title.textContent = callFlowLabel ? `Event Sequence V1.0 | ${callFlowLabel}` : "Event Sequence V1.0";
   svg.appendChild(title);
@@ -400,10 +467,18 @@ function addTitle(svg, callFlowLabel, callingLabel, calledLabel) {
     x: 20,
     y: 40,
     "font-size": 10,
-    fill: "#777"
+    fill: "#000"
   });
   authorText.textContent = "by HB";
   svg.appendChild(authorText);
+
+  const onlyCalled = eventPresence.hasCalled && !eventPresence.hasCalling;
+  const onlyCalling = eventPresence.hasCalling && !eventPresence.hasCalled;
+
+  const callingBoxFill = onlyCalled ? "#eeeeee" : "#dceeff";
+  const callingBoxStroke = onlyCalled ? "#cccccc" : "#9fc5e8";
+  const calledBoxFill = onlyCalling ? "#eeeeee" : "#e9f7df";
+  const calledBoxStroke = onlyCalling ? "#cccccc" : "#b6d7a8";
 
   const badge1 = createSvgEl("rect", {
     x: 20,
@@ -412,8 +487,8 @@ function addTitle(svg, callFlowLabel, callingLabel, calledLabel) {
     ry: 4,
     width: 170,
     height: 24,
-    fill: "#dceeff",
-    stroke: "#9fc5e8"
+    fill: callingBoxFill,
+    stroke: callingBoxStroke
   });
   svg.appendChild(badge1);
 
@@ -421,7 +496,7 @@ function addTitle(svg, callFlowLabel, callingLabel, calledLabel) {
     x: 30,
     y: 68,
     "font-size": 12,
-    fill: "#222"
+    fill: "#000"
   });
   badge1Text.textContent = `Calling: ${callingLabel || "-"}`;
   svg.appendChild(badge1Text);
@@ -433,8 +508,8 @@ function addTitle(svg, callFlowLabel, callingLabel, calledLabel) {
     ry: 4,
     width: 170,
     height: 24,
-    fill: "#e9f7df",
-    stroke: "#b6d7a8"
+    fill: calledBoxFill,
+    stroke: calledBoxStroke
   });
   svg.appendChild(badge2);
 
@@ -442,7 +517,7 @@ function addTitle(svg, callFlowLabel, callingLabel, calledLabel) {
     x: 215,
     y: 68,
     "font-size": 12,
-    fill: "#222"
+    fill: "#000"
   });
   badge2Text.textContent = `Called: ${calledLabel || "-"}`;
   svg.appendChild(badge2Text);
@@ -481,7 +556,7 @@ function drawLanes(svg, laneNames, laneX, topY, bottomY) {
       "text-anchor": "middle",
       "font-size": 12,
       "font-weight": "600",
-      fill: "#222"
+      fill: "#000"
     });
     topText.textContent = name;
     svg.appendChild(topText);
@@ -504,7 +579,7 @@ function drawLanes(svg, laneNames, laneX, topY, bottomY) {
       "text-anchor": "middle",
       "font-size": 12,
       "font-weight": "600",
-      fill: "#222"
+      fill: "#000"
     });
     bottomText.textContent = name;
     svg.appendChild(bottomText);
@@ -520,12 +595,13 @@ function addTooltip(el, text, enabled) {
 
 function drawSameLaneEvent(svg, row, x, y, showTooltips) {
   const g = createSvgEl("g");
+  const colors = getEventArrowColors(row);
 
   const tsText = createSvgEl("text", {
     x: 20,
     y: y + 4,
     "font-size": 9,
-    fill: "#444"
+    fill: "#000"
   });
   tsText.textContent = formatFullTimestamp(row.start_ts_raw);
   g.appendChild(tsText);
@@ -535,14 +611,14 @@ function drawSameLaneEvent(svg, row, x, y, showTooltips) {
         C ${x + 34} ${y}, ${x + 34} ${y + 28}, ${x} ${y + 28}
         C ${x - 18} ${y + 28}, ${x - 18} ${y + 8}, ${x} ${y + 8}`,
     fill: "none",
-    stroke: "#333",
+    stroke: colors.stroke,
     "stroke-width": 2
   });
   g.appendChild(path);
 
   const arrowHead = createSvgEl("polygon", {
     points: `${x},${y + 8} ${x - 8},${y + 4} ${x - 8},${y + 12}`,
-    fill: "#333"
+    fill: colors.fill
   });
   g.appendChild(arrowHead);
 
@@ -551,7 +627,7 @@ function drawSameLaneEvent(svg, row, x, y, showTooltips) {
     y: y + 12,
     "font-size": 10,
     "font-weight": "600",
-    fill: "#222"
+    fill: "#000"
   });
   eventText.textContent = row.event_name || "";
   g.appendChild(eventText);
@@ -560,7 +636,7 @@ function drawSameLaneEvent(svg, row, x, y, showTooltips) {
     x: x + 40,
     y: y + 28,
     "font-size": 9,
-    fill: "#666"
+    fill: "#000"
   });
   metaText.textContent = [row.rat_name, row.cell_id].filter(Boolean).join(" | ");
   g.appendChild(metaText);
@@ -581,7 +657,7 @@ function drawSameLaneEvent(svg, row, x, y, showTooltips) {
       x: x - 14,
       y: y + 18,
       "font-size": 9,
-      fill: "#8a6d00",
+      fill: "#000",
       "text-anchor": "end"
     });
     elapsed.textContent = row.elapsedLabel;
@@ -594,12 +670,13 @@ function drawSameLaneEvent(svg, row, x, y, showTooltips) {
 
 function drawCrossLaneEvent(svg, row, x1, x2, y, showTooltips) {
   const g = createSvgEl("g");
+  const colors = getEventArrowColors(row);
 
   const tsText = createSvgEl("text", {
     x: 20,
     y: y + 4,
     "font-size": 9,
-    fill: "#444"
+    fill: "#000"
   });
   tsText.textContent = formatFullTimestamp(row.start_ts_raw);
   g.appendChild(tsText);
@@ -609,7 +686,7 @@ function drawCrossLaneEvent(svg, row, x1, x2, y, showTooltips) {
     y1: y,
     x2: x2,
     y2: y,
-    stroke: "#333",
+    stroke: colors.stroke,
     "stroke-width": 2
   });
   g.appendChild(line);
@@ -617,7 +694,7 @@ function drawCrossLaneEvent(svg, row, x1, x2, y, showTooltips) {
   const dir = x2 >= x1 ? 1 : -1;
   const arrowHead = createSvgEl("polygon", {
     points: `${x2},${y} ${x2 - 10 * dir},${y - 5} ${x2 - 10 * dir},${y + 5}`,
-    fill: "#333"
+    fill: colors.fill
   });
   g.appendChild(arrowHead);
 
@@ -628,7 +705,7 @@ function drawCrossLaneEvent(svg, row, x1, x2, y, showTooltips) {
     y: y - 12,
     "font-size": 10,
     "font-weight": "600",
-    fill: "#222"
+    fill: "#000"
   });
   eventText.textContent = row.event_name || "";
   g.appendChild(eventText);
@@ -637,7 +714,7 @@ function drawCrossLaneEvent(svg, row, x1, x2, y, showTooltips) {
     x: left + 8,
     y: y + 15,
     "font-size": 9,
-    fill: "#666"
+    fill: "#000"
   });
   metaText.textContent = [row.rat_name, row.cell_id].filter(Boolean).join(" | ");
   g.appendChild(metaText);
@@ -658,7 +735,7 @@ function drawCrossLaneEvent(svg, row, x1, x2, y, showTooltips) {
       x: (x1 + x2) / 2,
       y: y - 26,
       "font-size": 9,
-      fill: "#8a6d00",
+      fill: "#000",
       "text-anchor": "middle"
     });
     elapsed.textContent = row.elapsedLabel;
@@ -701,6 +778,7 @@ function renderLookerViz(data, element, config, queryResponse) {
   const callFlowLabel = rows[0].call_flow_label || "";
   const callingLabel = rows[0].calling_final_call_label || "";
   const calledLabel = rows[0].called_final_call_label || "";
+  const eventPresence = getEventPresence(rows);
 
   const leftPad = 120;
   const rightPad = 120;
@@ -720,7 +798,7 @@ function renderLookerViz(data, element, config, queryResponse) {
     style: "font-family: Arial, sans-serif; background: white; display: block;"
   });
 
-  addTitle(svg, callFlowLabel, callingLabel, calledLabel);
+  addTitle(svg, callFlowLabel, callingLabel, calledLabel, eventPresence);
 
   const laneX = laneNames.map((name, idx) =>
     leftPad + idx * (layout.laneSpacing * 0.8) + 80
