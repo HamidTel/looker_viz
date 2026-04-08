@@ -349,7 +349,7 @@ function resolveFieldMap(queryResponse) {
   }
 
   // optional field for elapsed display
-  const timeSinceInviteField = findMatchingFieldName(queryResponse, ["time_since_invite"], false);
+  const timeSinceInviteField = findMatchingFieldName(queryResponse, ["time_since_invite_sec"], false);
   fieldMap.time_since_invite = timeSinceInviteField || null;
 
   const ordered = getOrderedFieldNames(queryResponse);
