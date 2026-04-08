@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Telecom Call Trace Pipeline Documentation</title>
+    <style>
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            line-height: 1.6; 
+            max-width: 1000px; 
+            margin: 40px auto; 
+            padding: 0 20px; 
+            color: #333; 
+        }
+        h1, h2 { 
+            color: #2c3e50; 
+            border-bottom: 1px solid #eee; 
+            padding-bottom: 10px; 
+            margin-top: 40px;
+        }
+        code { 
+            background: #f4f4f4; 
+            padding: 3px 6px; 
+            border-radius: 4px; 
+            color: #d63384; 
+            font-family: monospace; 
+        }
+        .mermaid-container { 
+            margin: 30px 0; 
+            padding: 20px; 
+            background: #fdfdfd; 
+            border: 1px solid #e0e0e0; 
+            border-radius: 8px; 
+        }
+    </style>
+    <script type="module">
+        import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: { primaryColor: '#f8fafc', primaryBorderColor: '#cbd5e1' } });
+    </script>
+</head>
+<body>
+
+<h1>Technical Documentation: Telecom Call Trace & Signaling Aggregation Pipeline</h1>
+
+<h2>Executive Summary</h2>
+<p>This document outlines the architecture and logic of the Telecom Call Trace SQL pipeline. The pipeline ingests raw, multi-protocol control plane signaling data (SIP, GTP/ESM, NGAP, DIAMETER) and transforms it into a sequence-ready, topology-aware Call Detail Record (CDR) dataset.</p>
+<p>The primary objective is to group individual network packets into unique call sessions, attribute events to specific network nodes (Caller vs. Called, UE vs. Core), calculate mobility and latency KPIs, and unpivot the data into a timeline format suitable for sequence diagrams and Gantt charts.</p>
+
+<h2>High-Level Conceptual Architecture</h2>
+<p>The pipeline is designed around four distinct logical layers, progressively transforming raw, stateless network packets into highly contextualized, sequence-ready call records.</p>
+
+<div class="mermaid-container">
+<pre class="mermaid">
+graph TD
+    Raw[(Raw Network Signaling <br> SIP, GTP, NGAP, DIA)]
+    subgraph Layer1 ["1. Ingestion & Identity Layer"]
+        Norm[Data Normalization & RAT Resolution]
+        Role[Caller/Called Role Identification]
+        Stitch[Cross-Message Identity Stitching]
+        Norm --> Role --> Stitch
+    end
+    subgraph Layer2 ["2. Sessionization Layer"]
+        Detect[Call Boundary Detection >3s]
+        IDGen[Unique Call ID Generation & Fill-Down]
+        Pivot[Directional Pivot Caller vs Called]
+        Detect --> IDGen --> Pivot
+    end
+    subgraph Layer3 ["3. Intelligence & KPI Layer"]
+        State[State Accumulation First/Last]
+        Metrics[Latency & Failure Diagnostics]
+        State --> Metrics
+    end
+    subgraph Layer4 ["4. Presentation Layer"]
+        Classify[Call Type Classification]
+        Unpivot[Wide-to-Long Unpivoting]
+        Topo[Network Topology Mapping]
+        Classify --> Unpivot --> Topo
+    end
+    Raw --> Layer1 --> Layer2 --> Layer3 --> Layer4 --> Final[(Sequence-Ready CDRs)]
+</pre>
+</div>
+
+<h2>1. Data Extraction & Normalization (<code>base</code>)</h2>
+<p><strong>Purpose:</strong> Acts as the foundational ingestion layer. It filters raw network events for a specific time window, normalizes MSISDNs, resolves Radio Access Technology (RAT) fallbacks based on cell length, and bridges the calling address to the B-Party's IMSI via a reference table.</p>
+
+<div class="mermaid-container">
+<pre class="mermaid">
+graph TD
+    Start([Start: bq_control_plane]) --> Filter{Initial Filters}
+    Filter --> |Time/Messages| MsgTypes[INVITE, BYE, NGAP MOD, GTP CBR, DIA ASR]
+    MsgTypes --> Join[LEFT JOIN msisdn_ban]
+    Join --> RAT_Calc[Determine RAT: 5G-NR, EUTRAN, UTRAN]
+    Join --> PhoneFields[Normalize MSISDNs]
+    Join --> TS_Logic[Extract Protocol Timestamps]
+    RAT_Calc & PhoneFields & TS_Logic --> Output([Result: base])
+</pre>
+</div>
+
+<h2>2. Identity & Role Resolution (<code>base_processed</code>)</h2>
+<p><strong>Purpose:</strong> Utilizes a 20-row preceding window to standardizes MSISDNs by prepending country codes and explicitly defines the A-Party (<code>calling_imsi</code>) and B-Party (<code>called_imsi</code>) based on SIP Client-Server interaction types.</p>
+
+<div class="mermaid-container">
+<pre class="mermaid">
+graph TD
+    Input([Input: base]) --> Window[Partition by subscriber_id]
+    Window --> Concat1[Standardize Calling/Called Numbers]
+    Window --> ID_Logic{Identify Role}
+    ID_Logic --> |INVITE C-S| CallingIMSI[Assign calling_imsi]
+    ID_Logic --> |INVITE S-C| CalledIMSI_A[Assign called_imsi]
+    Concat1 & CallingIMSI & CalledIMSI_A --> Output([Result: base_processed])
+</pre>
+</div>
+
+<h2>3. Data Stitching (<code>base_filled</code>)</h2>
+<p><strong>Purpose:</strong> Generates a <code>pair_key_msisdn</code> to link all messages between two specific numbers. It uses a lookback window function to propagate the identified caller/called IMSIs to mid-call signaling packets.</p>
+
+<div class="mermaid-container">
+<pre class="mermaid">
+graph TD
+    Input([Input: base_processed]) --> KeyGen[Create pair_key_msisdn]
+    KeyGen --> Range[Lookback: 20 rows preceding]
+    Range --> FillCalling[Fetch/Keep calling_imsi]
+    Range --> FillCalled[Fetch/Keep called_imsi]
+    FillCalling & FillCalled --> Output([Result: base_filled])
+</pre>
+</div>
+
+<h2>4. Sessionization & Directional Pivot (<code>prep</code>)</h2>
+<p><strong>Purpose:</strong> The core processing engine. Identifies genuine new call attempts by looking for a >3s gap between <code>INVITE</code> packets, generating an MD5 hash. Pivots all multi-protocol events into Calling vs Called side columns.</p>
+
+<div class="mermaid-container">
+<pre class="mermaid">
+graph TD
+    Input([Input: base_filled]) --> Filter[Filter: Target IMSI]
+    Filter --> LAG{Is INVITE and LAG > 3s?}
+    LAG -->|Yes| NewCall[Generate call_id Hash]
+    LAG -->|No| ExistingCall[call_id = NULL]
+    Filter --> RoleSplit{Check Subscriber}
+    RoleSplit -->|calling_imsi| C_Logic[Map to Calling Fields]
+    RoleSplit -->|called_imsi| B_Logic[Map to Called Fields]
+    NewCall & C_Logic & B_Logic --> Output([Result: prep])
+</pre>
+</div>
+
+<h2>5. Session ID Propagation (<code>call_id</code>)</h2>
+<p><strong>Purpose:</strong> Executes a fill-down operation to propagate the specific <code>call_id</code> to all subsequent signaling packets belonging to that session.</p>
+
+<div class="mermaid-container">
+<pre class="mermaid">
+graph TD
+    Input([Input: prep]) --> Frame[Frame: UNBOUNDED PRECEDING to CURRENT ROW]
+    Frame --> CheckID{Is call_id NULL?}
+    CheckID -->|No| Keep[Use existing call_id]
+    CheckID -->|Yes| Fetch[LAST_VALUE call_id IGNORE NULLS]
+    Keep & Fetch --> Output([Result: call_id])
+</pre>
+</div>
+
+<h2>6. State Accumulation (<code>summary</code>)</h2>
+<p><strong>Purpose:</strong> An aggregation layer that uses FIRST_VALUE and LAST_VALUE across an unbounded window to ensure every row contains the full state of the call. Calculates distinct RAT and Cell IDs for handovers.</p>
+
+<div class="mermaid-container">
+<pre class="mermaid">
+graph TD
+    Input([Input: call_id]) --> Part[Partition by last_call_id]
+    Part --> SIP[First/Last INVITE & BYE]
+    Part --> Bearer[First/Last Bearer State]
+    Part --> Radio[Radio Mod / Abort State]
+    Part --> DCount[Count unique cell_id & rat_name]
+    SIP & Bearer & Radio & DCount --> Output([Result: summary])
+</pre>
+</div>
+
+<h2>7. KPI Calculation (<code>metrics</code>)</h2>
+<p><strong>Purpose:</strong> Computes diagnostic timings (EPSFB latency, setup time, sync delays) and creates Mobility Path fingerprints.</p>
+
+<div class="mermaid-container">
+<pre class="mermaid">
+graph TD
+    Input([Input: summary]) --> Filter[Filter: BYE_T]
+    Filter --> CBR_Check{Failure TS > Success TS?}
+    CBR_Check --> CBR_Fail[Flag Failure + Error]
+    CBR_Check --> KPIs[Calculate Latencies]
+    KPIs --> Paths[Create Initial/Final RAT & Cell Paths]
+    CBR_Fail & Paths --> Output([Result: metrics])
+</pre>
+</div>
+
+<h2>8. Classification & Unnesting (<code>unpivoted_events</code>)</h2>
+<p><strong>Purpose:</strong> Finalizes call technology (VoLTE vs VoNR vs EPSFB) and transitions the dataset to a Long format using an UNNEST array for timeline generation.</p>
+
+<div class="mermaid-container">
+<pre class="mermaid">
+graph TD
+    Input([Input: metrics]) --> RAT_Check{Check RAT & Bearer}
+    RAT_Check --> Classify[Label: VoNR, VoLTE, EPSFB]
+    Classify --> UNNEST[UNNEST Array of STRUCTs into Event Rows]
+    UNNEST --> Output([Result: unpivoted_events])
+</pre>
+</div>
+
+<h2>9. Topology & Timeline Assembly (Final Output)</h2>
+<p><strong>Purpose:</strong> The presentation layer. Resolves hanging labels, calculates relative timeline, and maps abstract events to physical network topology (e.g., UE1, P-CSCF, MME, gNB).</p>
+
+<div class="mermaid-container">
+<pre class="mermaid">
+graph TD
+    Input([Input: unpivoted_events]) --> Elapsed[Calculate Relative Time: TS - Call Start]
+    Elapsed --> NodeMap{CASE: event_name & Entry Type}
+    NodeMap -->|BYE Client-Server| UE_Hangup[Source: UE1/UE2]
+    NodeMap -->|BYE Server-Client| Net_Hangup[Source: P-CSCF]
+    NodeMap -->|Bearer| Nodes[SGW ➔ MME]
+    UE_Hangup & Net_Hangup & Nodes --> FinalOut([Result: Trace-Ready Dataset])
+</pre>
+</div>
+
+</body>
+</html>
