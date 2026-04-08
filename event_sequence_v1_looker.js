@@ -62,10 +62,11 @@ looker.plugins.visualizations.add({
       doneRendering();
     } catch (err) {
       container.innerHTML = `
-        <div style="padding:16px;color:#b00020;font-family:Arial,sans-serif;white-space:pre-wrap;">
-          Visualization error: ${err && err.message ? err.message : String(err)}
-        </div>
-      `;
+  <div style="padding:20px;font-family:Arial,sans-serif;color:#b00020;line-height:1.5;white-space:pre-wrap;">
+    <div style="font-weight:700;font-size:16px;margin-bottom:10px;">Visualization Error</div>
+    <div style="font-size:13px;">${err && err.message ? err.message : String(err)}</div>
+  </div>
+`;
       console.error(err);
       doneRendering();
     }
@@ -81,7 +82,18 @@ const DEFAULT_STYLE = {
 };
 
 const REQUIRED_SEQUENCE_TEXT =
-  "Expected field sequence: call_flow_label (or source_number), event_name, start_ts (or start_ts_time / start ts time), rat_name, cell_id, source_node, destination_node, remarks, calling_final_call_label, called_final_call_label, <tooltip field immediately after called_final_call_label>.";
+  "Expected field order:\n" +
+  "1. call_flow_label (or source_number)\n" +
+  "2. event_name\n" +
+  "3. start_ts (or start_ts_time / start ts time)\n" +
+  "4. rat_name\n" +
+  "5. cell_id\n" +
+  "6. source_node\n" +
+  "7. destination_node\n" +
+  "8. remarks\n" +
+  "9. calling_final_call_label\n" +
+  "10. called_final_call_label\n" +
+  "11. tooltip field immediately after called_final_call_label";
 
 function parseLaneOrderConfig(value) {
   if (!value) {
@@ -245,14 +257,14 @@ function findMatchingFieldName(queryResponse, aliases, allowTimeSuffix = false) 
 
 function resolveFieldMap(queryResponse) {
   const requiredDefs = [
-    { key: "source_number", aliases: ["call_flow_label", "source_number"], allowTimeSuffix: false },
+    { key: "call_flow_label", aliases: ["call_flow_label", "source_number"], allowTimeSuffix: false },
     { key: "event_name", aliases: ["event_name"], allowTimeSuffix: false },
     { key: "start_ts_raw", aliases: ["start_ts"], allowTimeSuffix: true },
     { key: "rat_name", aliases: ["rat_name"], allowTimeSuffix: false },
     { key: "cell_id", aliases: ["cell_id"], allowTimeSuffix: false },
     { key: "source_node", aliases: ["source_node"], allowTimeSuffix: false },
     { key: "destination_node", aliases: ["destination_node"], allowTimeSuffix: false },
-    { key: "remarks", aliases: ["remarks"], allowTimeSuffix: false },
+    { key: "remarks", aliases: ["remarks","remarks_styled"], allowTimeSuffix: false },
     { key: "calling_final_call_label", aliases: ["calling_final_call_label"], allowTimeSuffix: false },
     { key: "called_final_call_label", aliases: ["called_final_call_label"], allowTimeSuffix: false }
   ];
@@ -301,7 +313,7 @@ function getLookerRows(data, config, queryResponse) {
   const fieldMap = resolveFieldMap(queryResponse);
 
   const rows = data.map(r => ({
-    source_number: escapeText(cellToString(r[fieldMap.source_number])),
+    call_flow_label: escapeText(cellToString(r[fieldMap.call_flow_label])),
     event_name: escapeText(cellToString(r[fieldMap.event_name])),
     start_ts_raw: escapeText(cellToString(r[fieldMap.start_ts_raw])),
     rat_name: escapeText(cellToString(r[fieldMap.rat_name])),
@@ -686,7 +698,7 @@ function renderLookerViz(data, element, config, queryResponse) {
     return;
   }
 
-  const sourceNumber = rows[0].source_number || "";
+  const call_flow_label = rows[0].call_flow_label || "";
   const callingLabel = rows[0].calling_final_call_label || "";
   const calledLabel = rows[0].called_final_call_label || "";
 
